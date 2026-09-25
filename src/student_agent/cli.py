@@ -11,8 +11,10 @@ from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
 from .submission import package_submission, validate_artifacts
-from .trace import TraceWriter
+from .trace import CaseTraceBuffer, TraceWriter
 from .workflow import solve_case
+
+MAX_RECONNECTS = 5
 
 
 def _root(value: str) -> Path:
@@ -40,24 +42,46 @@ async def _run(root: Path) -> None:
     trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    pending = list(case_set.case_ids)
+    reconnects = 0
+    while pending:
+        try:
+            async with connect_gateway(
+                settings.mcp_endpoint, settings.team_api_key, contracts
+            ) as gateway:
+                discovered_tools = await gateway.list_tools()
+                if not discovered_tools:
+                    raise RuntimeError("MCP Gateway returned no tools")
+                while pending:
+                    await _run_case(case_set.cases[pending[0]], gateway, trace, output_root)
+                    pending.pop(0)
+        except Exception as exc:  # dropped MCP session: reconnect and resume the pending case
+            reconnects += 1
+            if reconnects > MAX_RECONNECTS:
+                raise RuntimeError(f"MCP session failed {reconnects} times") from exc
+            print(
+                f"WARN: MCP session dropped at {pending[0]} ({type(exc).__name__}); "
+                f"reconnecting {reconnects}/{MAX_RECONNECTS}",
+                file=sys.stderr,
             )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            await asyncio.sleep(2 * reconnects)
+
+
+async def _run_case(case: dict, gateway, trace: TraceWriter, output_root: Path) -> None:
+    case_id = case["case_id"]
+    buffer = CaseTraceBuffer(trace)
+    buffer.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+    output = await solve_case(case, gateway, buffer)
+    contracts = trace.contracts
+    contracts.validate_output(output, f"outputs/{case_id}.json")
+    if output.get("case_id") != case_id:
+        raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+    buffer.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+    target = output_root / f"{case_id}.json"
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+    buffer.commit()
 
 
 def parser() -> argparse.ArgumentParser:
