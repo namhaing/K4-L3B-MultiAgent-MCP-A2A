@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -31,6 +32,12 @@ from .trace import TraceWriter
 
 ORDER_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 CONFLICT_FIELDS = ("order_status", "order_purchase_timestamp")
+SELLER_ISSUES = {"late_delivery_seller", "unavailable_order_paid"}
+# Domains that do not support a conclusion are not cited (precision): a late delivery is proven
+# by order/shipment/item/seller/policy evidence; payment rows only feed the totals.
+UNCITED_DOMAINS = {"late_delivery_seller": {"payment"}, "late_delivery_logistics": {"payment"}}
+# Policy actions that return everything the customer paid for the order.
+FULL_REFUND_ACTIONS = {"issue_refund", "retry_refund"}
 
 
 async def solve_case(
@@ -65,11 +72,19 @@ async def _investigate(ctx: CaseContext) -> dict[str, Any]:
     history_rows: list[dict[str, Any]] = []
     customer_unique_id = None
     hint = case.get("customer_unique_id_hint")
-    if hint:
-        history = await ctx.call("entity-agent", "get_customer_history", customer_unique_id=hint)
-        if history and isinstance(history.data, dict):
-            history_rows = list(history.data.get("orders") or [])
-            customer_unique_id = history.data.get("customer_unique_id") or hint
+    claimed = request.get("claimed_order_id")
+    prefetch = isinstance(claimed, str) and bool(ORDER_ID_PATTERN.fullmatch(claimed))
+    # Customer history and the claimed order are independent lookups: run them together. The
+    # resolution loop below then reads the claimed order from the per-case cache.
+    history, _ = await asyncio.gather(
+        ctx.call("entity-agent", "get_customer_history", customer_unique_id=hint)
+        if hint
+        else _nothing(),
+        ctx.call("entity-agent", "get_order", order_id=claimed) if prefetch else _nothing(),
+    )
+    if history and isinstance(history.data, dict):
+        history_rows = list(history.data.get("orders") or [])
+        customer_unique_id = history.data.get("customer_unique_id") or hint
 
     candidates = list(case.get("candidate_order_ids") or [])
     claimed = request.get("claimed_order_id")
@@ -103,38 +118,45 @@ async def _investigate(ctx: CaseContext) -> dict[str, Any]:
     if findings is None:
         return _fallback(ctx, "NO_ORDER_VERSION", rejected=rejected, customer=customer_unique_id)
 
-    # --- Order/product agent ---------------------------------------------------------------
+    # --- Specialists: independent lookups run concurrently -----------------------------------
+    # Items, payments, refunds, shipment and policy only need the resolved order, so they are
+    # fetched in one round trip instead of up to five sequential ones (same calls, same refs).
+    need_refund = topic in REFUND_TOPICS  # other orders have no refund events (tool errors)
+    need_shipment = findings.late_by_dates or topic in LATE_TOPICS
+    policy_version = case.get("policy_version")
     ctx.emit("task_assigned", "coordinator", target="order-agent", decision_code="LOAD_ITEMS")
-    items = await ctx.call("order-agent", "get_order_items", order_id=resolved_id)
+    ctx.emit("task_assigned", "coordinator", target="payment-agent", decision_code="RECONCILE")
+    if need_shipment:
+        ctx.emit("task_assigned", "coordinator", target="shipment-agent", decision_code="TIMELINE")
+    ctx.emit("task_assigned", "coordinator", target="policy-agent", decision_code="APPLY_POLICY")
+    items, payments, refunds, shipment, policy = await asyncio.gather(
+        ctx.call("order-agent", "get_order_items", order_id=resolved_id),
+        ctx.call("payment-agent", "get_payment_timeline", order_id=resolved_id),
+        ctx.call("payment-agent", "get_refund_timeline", order_id=resolved_id)
+        if need_refund
+        else _nothing(),
+        ctx.call("shipment-agent", "get_shipment_summary", order_id=resolved_id)
+        if need_shipment
+        else _nothing(),
+        ctx.call("policy-agent", "get_policy", policy_version=policy_version)
+        if policy_version
+        else _nothing(),
+    )
     if items and isinstance(items.data, list):
         attach_items(findings, items.data)
-    ctx.emit("handoff", "order-agent", target="coordinator", decision_code="ITEMS_LOADED",
-             evidence_refs=ctx.refs_of("order-agent"), attributes={"items": len(findings.items)})
-
-    # --- Payment/refund agent --------------------------------------------------------------
-    ctx.emit("task_assigned", "coordinator", target="payment-agent", decision_code="RECONCILE")
-    payments = await ctx.call("payment-agent", "get_payment_timeline", order_id=resolved_id)
     if payments and isinstance(payments.data, dict):
         attach_payments(findings, payments.data)
-    # Refund lifecycle is only fetched for refund complaints: for other orders the gateway has
-    # no refund events and the call returns an error, costing budget without evidence.
-    if topic in REFUND_TOPICS:
-        refunds = await ctx.call("payment-agent", "get_refund_timeline", order_id=resolved_id)
-        if refunds and isinstance(refunds.data, dict):
-            attach_refunds(findings, refunds.data)
+    if refunds and isinstance(refunds.data, dict):
+        attach_refunds(findings, refunds.data)
+    if shipment and isinstance(shipment.data, dict):
+        attach_shipment(findings, shipment.data)
+    ctx.emit("handoff", "order-agent", target="coordinator", decision_code="ITEMS_LOADED",
+             evidence_refs=ctx.refs_of("order-agent"), attributes={"items": len(findings.items)})
     ctx.emit("handoff", "payment-agent", target="coordinator",
              decision_code=payment_verdict(findings, detect_issue(findings)).upper(),
              evidence_refs=ctx.refs_of("payment-agent"),
              attributes={"captured_total_brl": findings.captured_total})
-
-    # --- Shipment agent --------------------------------------------------------------------
-    # Refuting a claim needs the delivery timeline too, not only the payment side.
-    refuting = detect_issue(findings) == "unsupported_claim"
-    if findings.late_by_dates or topic in LATE_TOPICS or refuting:
-        ctx.emit("task_assigned", "coordinator", target="shipment-agent", decision_code="TIMELINE")
-        shipment = await ctx.call("shipment-agent", "get_shipment_summary", order_id=resolved_id)
-        if shipment and isinstance(shipment.data, dict):
-            attach_shipment(findings, shipment.data)
+    if need_shipment:
         ctx.emit("handoff", "shipment-agent", target="coordinator",
                  decision_code=shipment_verdict(findings, detect_issue(findings)).upper(),
                  evidence_refs=ctx.refs_of("shipment-agent"))
@@ -142,14 +164,18 @@ async def _investigate(ctx: CaseContext) -> dict[str, Any]:
     issue = detect_issue(findings, topic)
     ambiguous = len(detect_issues(findings)) > 1
 
-    # --- Policy agent ----------------------------------------------------------------------
-    ctx.emit("task_assigned", "coordinator", target="policy-agent", decision_code="APPLY_POLICY")
+    # --- Seller verification: a seller held responsible must be backed by seller records ----
+    if issue in SELLER_ISSUES:
+        ctx.emit("task_assigned", "coordinator", target="order-agent",
+                 decision_code="VERIFY_SELLER")
+        await ctx.call("order-agent", "get_sellers", order_id=resolved_id)
+        ctx.emit("handoff", "order-agent", target="coordinator", decision_code="SELLER_VERIFIED",
+                 evidence_refs=ctx.refs_of("order-agent"))
+
+    # --- Policy agent (policy evidence fetched with the specialists above) -----------------
     rule: dict[str, Any] = {}
-    policy_version = case.get("policy_version")
-    if policy_version:
-        policy = await ctx.call("policy-agent", "get_policy", policy_version=policy_version)
-        if policy and isinstance(policy.data, dict):
-            rule = (policy.data.get("rules") or {}).get(issue) or {}
+    if policy and isinstance(policy.data, dict):
+        rule = (policy.data.get("rules") or {}).get(issue) or {}
     ctx.emit("policy_decided", "policy-agent", decision_code=issue,
              attributes={"case_status": rule.get("case_status"),
                          "action": rule.get("recommended_action")})
@@ -177,6 +203,10 @@ async def _investigate(ctx: CaseContext) -> dict[str, Any]:
              attributes={"fixes": len(fixes), "mcp_calls": ctx.call_count})
     ctx.emit("handoff", "verifier", target="coordinator", decision_code="VERIFIED")
     return output
+
+
+async def _nothing() -> None:
+    return None
 
 
 def _debug_dump(ctx: CaseContext) -> None:
@@ -248,7 +278,8 @@ def _compose(
                                               else "needs_investigation")
     if case_status == "no_action":
         refund = 0.0
-    evidence_refs = list(ctx.ledger)[:30]
+    uncited = UNCITED_DOMAINS.get(issue, set())
+    evidence_refs = [ref for ref, ev in ctx.ledger.items() if ev.domain not in uncited][:30]
 
     matched = topic == issue
     confidence = (0.75 if ambiguous else 0.9) if matched else 0.6
@@ -275,7 +306,7 @@ def _compose(
             "payment_references": [],
             "shipment_ids": [],
         },
-        "claim_assessments": _claims(ctx, issue, refund, f, evidence_refs),
+        "claim_assessments": _claims(ctx, issue, refund, action, evidence_refs),
         "entity_resolution": {
             "status": "resolved",
             "resolved_order_ids": [f.order_id],
@@ -329,7 +360,7 @@ def _captured(f: Findings, issue: str) -> float:
 
 
 def _claims(
-    ctx: CaseContext, issue: str, refund: float, f: Findings, refs: list[str]
+    ctx: CaseContext, issue: str, refund: float, action: str | None, refs: list[str]
 ) -> list[dict[str, Any]]:
     assessments = []
     for claim in (ctx.case.get("customer_request") or {}).get("claims") or []:
@@ -337,9 +368,11 @@ def _claims(
         if not isinstance(claim_id, str) or not claim_id:
             continue
         if topic == "requested_full_refund":
+            # A full refund is only supported when policy returns the whole payment; freight,
+            # duplicate or reconciliation refunds support the request only in part.
             if refund <= 0:
                 verdict = "unsupported"
-            elif f.captured_total and refund >= f.captured_total - 0.01:
+            elif action in FULL_REFUND_ACTIONS:
                 verdict = "supported"
             else:
                 verdict = "partially_supported"

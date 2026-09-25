@@ -9,7 +9,7 @@ from .trace import TraceWriter
 # Least privilege: each actor may only call the tools of its own domain.
 TOOL_PERMISSIONS: dict[str, frozenset[str]] = {
     "entity-agent": frozenset({"get_customer_history", "get_order"}),
-    "order-agent": frozenset({"get_order_items", "get_product_context"}),
+    "order-agent": frozenset({"get_order_items", "get_product_context", "get_sellers"}),
     "payment-agent": frozenset(
         {"get_payment_timeline", "get_order_payments", "get_refund_timeline"}
     ),
